@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: mediaflow-backend
+    env: python
+    buildCommand: bash build.sh
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DB_HOST
+        value: sql113.cpanelfree.com
+      - key: DB_PORT
+        value: 3306
+      - key: DB_NAME
+        value: cpfr_41396776_Mediaflow
+      - key: DB_USER
+        value: cpfr_41396776
+      - key: DB_PASS
+        value: 7g6UNkmt20
+      - key: SECRET_KEY
+        generateValue: true
+      - key: JWT_SECRET
+        generateValue: true
+      - key: DEBUG
+        value: false
+      - key: YTDLP_PATH
+        value: /usr/local/bin/yt-dlp
+      - key: FFMPEG_PATH
+        value: /usr/local/bin/ffmpeg
+      - key: UPLOAD_TEMP
+        value: /tmp/mediaflow_uploads
+      - key: DOWNLOAD_TEMP
+        value: /tmp/mediaflow_dl
+      - key: ALLOWED_ORIGINS
+        value: https://yourdomain.cpanelfree.com,http://localhost
