@@ -1,7 +1,6 @@
 """
-routes/download.py
-yt-dlp powered. Returns direct stream URL to browser.
-Works without ffmpeg by using pre-merged formats only.
+routes/download.py — yt-dlp powered downloads
+ffmpeg provided by imageio-ffmpeg (works on Render read-only fs)
 """
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,24 +9,42 @@ from pydantic import BaseModel
 from database import get_db, get_setting
 from middleware.auth import get_current_user, get_user_optional
 from utils.helpers import ok, err, paged
-from config import settings
-import asyncio, json, re, shutil
+import asyncio, json, re, os
 
 router = APIRouter()
 
+# Get ffmpeg path from imageio-ffmpeg at startup
+try:
+    import imageio_ffmpeg
+    FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
+except Exception:
+    FFMPEG_BIN = "ffmpeg"
+
 PLATFORMS = {
-    "youtube":     {"re": r"(youtube\.com|youtu\.be)",    "icon": "fa-brands fa-youtube",    "color": "#FF0000"},
-    "tiktok":      {"re": r"tiktok\.com",                  "icon": "fa-brands fa-tiktok",      "color": "#010101"},
-    "instagram":   {"re": r"instagram\.com",               "icon": "fa-brands fa-instagram",   "color": "#E1306C"},
-    "twitter":     {"re": r"(twitter\.com|x\.com)",        "icon": "fa-brands fa-x-twitter",   "color": "#000000"},
-    "facebook":    {"re": r"(facebook\.com|fb\.watch)",    "icon": "fa-brands fa-facebook",    "color": "#1877F2"},
-    "vimeo":       {"re": r"vimeo\.com",                   "icon": "fa-brands fa-vimeo-v",     "color": "#1AB7EA"},
-    "pinterest":   {"re": r"pinterest\.",                  "icon": "fa-brands fa-pinterest",   "color": "#E60023"},
-    "snapchat":    {"re": r"snapchat\.com",                "icon": "fa-brands fa-snapchat",    "color": "#FFFC00"},
-    "soundcloud":  {"re": r"soundcloud\.com",              "icon": "fa-brands fa-soundcloud",  "color": "#FF5500"},
-    "twitch":      {"re": r"twitch\.tv",                   "icon": "fa-brands fa-twitch",      "color": "#9146FF"},
-    "reddit":      {"re": r"reddit\.com",                  "icon": "fa-brands fa-reddit",      "color": "#FF4500"},
-    "dailymotion": {"re": r"dailymotion\.com",             "icon": "fa-solid fa-play",         "color": "#003E8A"},
+    "youtube":     {"re": r"(youtube\.com|youtu\.be)",      "icon": "fa-brands fa-youtube",    "color": "#FF0000"},
+    "tiktok":      {"re": r"tiktok\.com",                   "icon": "fa-brands fa-tiktok",      "color": "#010101"},
+    "instagram":   {"re": r"instagram\.com",                "icon": "fa-brands fa-instagram",   "color": "#E1306C"},
+    "twitter":     {"re": r"(twitter\.com|x\.com)",         "icon": "fa-brands fa-x-twitter",   "color": "#000000"},
+    "facebook":    {"re": r"(facebook\.com|fb\.watch)",     "icon": "fa-brands fa-facebook",    "color": "#1877F2"},
+    "vimeo":       {"re": r"vimeo\.com",                    "icon": "fa-brands fa-vimeo-v",     "color": "#1AB7EA"},
+    "pinterest":   {"re": r"pinterest\.",                   "icon": "fa-brands fa-pinterest",   "color": "#E60023"},
+    "snapchat":    {"re": r"snapchat\.com",                 "icon": "fa-brands fa-snapchat",    "color": "#FFFC00"},
+    "soundcloud":  {"re": r"soundcloud\.com",               "icon": "fa-brands fa-soundcloud",  "color": "#FF5500"},
+    "twitch":      {"re": r"twitch\.tv",                    "icon": "fa-brands fa-twitch",      "color": "#9146FF"},
+    "reddit":      {"re": r"reddit\.com",                   "icon": "fa-brands fa-reddit",      "color": "#FF4500"},
+    "dailymotion": {"re": r"dailymotion\.com",              "icon": "fa-solid fa-play",         "color": "#003E8A"},
+    "bilibili":    {"re": r"bilibili\.com",                 "icon": "fa-solid fa-video",        "color": "#00A1D6"},
+    "linkedin":    {"re": r"linkedin\.com",                 "icon": "fa-brands fa-linkedin",    "color": "#0A66C2"},
+}
+
+QUALITY_MAP = {
+    "max":   "bestvideo+bestaudio/best",
+    "4k":    "bestvideo[height<=2160]+bestaudio/best",
+    "1440p": "bestvideo[height<=1440]+bestaudio/best",
+    "1080p": "bestvideo[height<=1080]+bestaudio/best",
+    "720p":  "bestvideo[height<=720]+bestaudio/best",
+    "480p":  "bestvideo[height<=480]+bestaudio/best",
+    "360p":  "bestvideo[height<=360]+bestaudio/best",
 }
 
 
@@ -38,30 +55,14 @@ def detect_platform(url: str) -> str:
     return "other"
 
 
-def get_ytdlp_path() -> str:
-    """Find yt-dlp wherever it is installed."""
-    path = shutil.which("yt-dlp")
-    if path:
-        return path
-    for p in ["/usr/local/bin/yt-dlp", "/usr/bin/yt-dlp", "/opt/render/project/src/.venv/bin/yt-dlp"]:
-        import os
-        if os.path.isfile(p):
-            return p
-    return "yt-dlp"
-
-
-async def run_ytdlp(*args, timeout=60) -> tuple[int, str, str]:
-    cmd = [get_ytdlp_path()] + list(args)
+async def run_ytdlp(*args) -> tuple[int, str, str]:
+    cmd = ["yt-dlp", "--ffmpeg-location", FFMPEG_BIN] + list(args)
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        return 1, "", "Timeout"
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
     return proc.returncode, stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace")
 
 
@@ -90,11 +91,8 @@ async def analyze(
     plat_info = PLATFORMS.get(platform, {"icon": "fa-solid fa-video", "color": "#3B82F6"})
 
     code, stdout, stderr = await run_ytdlp(
-        "--dump-json",
-        "--no-playlist",
-        "--no-warnings",
-        "--no-check-certificates",
-        url
+        "--dump-json", "--no-playlist",
+        "--no-warnings", "--no-check-certificates", url
     )
 
     if code != 0 or not stdout.strip():
@@ -107,7 +105,7 @@ async def analyze(
         return err("Could not fetch video info. Check the URL and try again.")
 
     try:
-        info = json.loads(stdout.strip().split('\n')[0])
+        info = json.loads(stdout.split('\n')[0])
     except json.JSONDecodeError:
         return err("Failed to parse video metadata.")
 
@@ -137,50 +135,39 @@ async def start_download(
     db: AsyncSession = Depends(get_db),
     cu=Depends(get_user_optional),
 ):
-    url        = body.url.strip()
-    platform   = detect_platform(url)
-    user_id    = cu["id"] if cu else None
-    user_plan  = cu["plan"] if cu else "free"
-    ip         = req.client.host
+    url = body.url.strip()
+    platform  = detect_platform(url)
+    user_id   = cu["id"] if cu else None
+    user_plan = cu["plan"] if cu else "free"
+    ip        = req.client.host
 
-    # Daily limit check for free users
+    # Daily limit check
     free_limit = int(await get_setting(db, "free_downloads_day", "10"))
     if user_plan == "free":
-        cnt_query = (
-            text("SELECT COUNT(*) FROM downloads WHERE user_id=:id AND DATE(created_at)=CURDATE()")
-            if user_id else
-            text("SELECT COUNT(*) FROM downloads WHERE ip_address=:id AND DATE(created_at)=CURDATE() AND user_id IS NULL")
-        )
-        cnt = (await db.execute(cnt_query, {"id": user_id or ip})).scalar()
-        if cnt >= free_limit:
+        if user_id:
+            cnt = await db.execute(
+                text("SELECT COUNT(*) FROM downloads WHERE user_id=:id AND DATE(created_at)=CURDATE()"),
+                {"id": user_id}
+            )
+        else:
+            cnt = await db.execute(
+                text("SELECT COUNT(*) FROM downloads WHERE ip_address=:ip AND DATE(created_at)=CURDATE() AND user_id IS NULL"),
+                {"ip": ip}
+            )
+        if cnt.scalar() >= free_limit:
             return err(f"Free limit: {free_limit} downloads/day. Upgrade to Pro for unlimited.", 429)
 
-    # Build format selector — no ffmpeg needed
-    # Use best pre-merged format so no post-processing required
-    if body.audio_only:
-        fmt = "bestaudio[ext=mp3]/bestaudio[ext=m4a]/bestaudio"
-    else:
-        fmt = body.format_id if body.format_id != "best" else "best[ext=mp4]/best"
+    fmt = "bestaudio/best" if body.audio_only else QUALITY_MAP.get(body.format_id, body.format_id)
 
-    # Get direct URL
+    # Get direct stream URL
     code, stdout, stderr = await run_ytdlp(
-        "--get-url",
-        "--format", fmt,
-        "--no-playlist",
-        "--no-warnings",
-        "--no-check-certificates",
-        url
+        "--get-url", "--format", fmt,
+        "--no-playlist", "--no-warnings",
+        "--no-check-certificates", url
     )
 
     if code != 0 or not stdout.strip():
-        # Fallback to absolute best single file
-        code, stdout, stderr = await run_ytdlp(
-            "--get-url", "--format", "best",
-            "--no-playlist", "--no-warnings", "--no-check-certificates",
-            url
-        )
-        if code != 0 or not stdout.strip():
-            return err("Could not extract download URL. The video may be restricted.")
+        return err("Could not extract download URL. The video may be restricted.")
 
     download_url = stdout.strip().split('\n')[0]
 
@@ -190,8 +177,9 @@ async def start_download(
         "--no-playlist", "-o", "%(title)s.%(ext)s", url
     )
     filename = fname_out.strip().split('\n')[0] if fname_out.strip() else "download.mp4"
+    if body.audio_only:
+        filename = filename.rsplit('.', 1)[0] + '.mp3'
 
-    # Log to DB
     result = await db.execute(
         text("""
             INSERT INTO downloads(user_id,platform,source_url,format,download_url,status,ip_address)
@@ -201,7 +189,6 @@ async def start_download(
          "fmt": "mp3" if body.audio_only else "mp4",
          "dl": download_url, "ip": ip}
     )
-
     if user_id:
         await db.execute(
             text("UPDATE users SET download_count=download_count+1 WHERE id=:id"),
@@ -228,53 +215,45 @@ async def history(
     )).scalar()
     offset = (page - 1) * per_page
     rows = await db.execute(
-        text("""SELECT id,platform,source_url,quality,format,status,created_at
-                FROM downloads WHERE user_id=:id
-                ORDER BY created_at DESC LIMIT :l OFFSET :o"""),
+        text("SELECT id,platform,source_url,quality,format,status,created_at FROM downloads WHERE user_id=:id ORDER BY created_at DESC LIMIT :l OFFSET :o"),
         {"id": cu["id"], "l": per_page, "o": offset}
     )
     return paged([dict(r._mapping) for r in rows], total, page, per_page)
 
 
 def _build_formats(raw_formats: list, user_plan: str, free_max: str) -> list:
-    FREE_MAX_MAP = {"360p": 0, "480p": 1, "720p": 2, "1080p": 3, "1440p": 4, "4k": 5}
+    FREE_MAX_MAP = {"360p": 0, "480p": 1, "720p": 2, "1080p": 3, "1440p": 4, "4k": 5, "max": 6}
     free_rank = FREE_MAX_MAP.get(free_max.lower().replace(" ", ""), 2)
 
-    # Get available heights
-    available = set()
-    for f in raw_formats:
-        h = f.get("height") or 0
-        if h:
-            available.add(h)
+    available_heights = {f.get("height") or 0 for f in raw_formats}
 
     quality_levels = [
-        ("8K",    "best[height>=4320][ext=mp4]/best[height>=4320]", 6),
-        ("4K",    "best[height>=2160][ext=mp4]/best[height>=2160]", 5),
-        ("1440p", "best[height>=1440][ext=mp4]/best[height>=1440]", 4),
-        ("1080p", "best[height>=1080][ext=mp4]/best[height>=1080]", 3),
-        ("720p",  "best[height>=720][ext=mp4]/best[height>=720]",   2),
-        ("480p",  "best[height>=480][ext=mp4]/best[height>=480]",   1),
-        ("360p",  "best[ext=mp4]/best",                              0),
-        ("MP3",   "bestaudio[ext=mp3]/bestaudio[ext=m4a]/bestaudio",-1),
+        ("8K",    "max",   7),
+        ("4K",    "4k",    5),
+        ("1440p", "1440p", 4),
+        ("1080p", "1080p", 3),
+        ("720p",  "720p",  2),
+        ("480p",  "480p",  1),
+        ("360p",  "360p",  0),
+        ("MP3",   "max",   -1),
     ]
 
     result = []
-    for label, fmt_str, rank in quality_levels:
+    for label, fmt_key, rank in quality_levels:
         is_audio = label == "MP3"
         requires_pro = (rank > free_rank) and not is_audio
         if user_plan in ("pro", "enterprise"):
             requires_pro = False
 
-        # Skip unavailable qualities
-        if not is_audio and available:
+        if not is_audio and available_heights:
             needed = {"8K": 4320, "4K": 2160, "1440p": 1440,
                       "1080p": 1080, "720p": 720, "480p": 480, "360p": 360}.get(label, 0)
-            if needed > 0 and not any(h >= needed * 0.85 for h in available):
+            if needed > 0 and not any(h >= needed * 0.9 for h in available_heights):
                 continue
 
         result.append({
             "label":        label,
-            "format_id":    fmt_str,
+            "format_id":    fmt_key,
             "ext":          "mp3" if is_audio else "mp4",
             "requires_pro": requires_pro,
             "audio_only":   is_audio,
